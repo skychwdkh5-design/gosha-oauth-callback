@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-yndZejF+mHy7zCpEFr+reROFxrHZG0S0wLd+uFPfmzQ='; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-fwrYXVVnUA5MBwCVNKNlf/zIks0LQjFnMV6ZRPzJNU8='; base-uri 'none'; form-action 'none'">
 <meta name="robots" content="noindex">
 <title>Gosha Threads OAuth</title>
 <style>
@@ -17,6 +17,8 @@
   textarea, input { width:100%; box-sizing:border-box; font:15px ui-monospace, Menlo, monospace; padding:12px; border-radius:10px; border:1px solid var(--muted); background:var(--box); color:var(--fg); }
   textarea { height:120px; word-break:break-all; }
   button, a.btn { display:inline-block; margin-top:12px; padding:12px 18px; border-radius:10px; border:0; background:var(--accent); color:#fff; font-size:17px; text-decoration:none; }
+  pre { white-space:pre-wrap; word-break:break-all; background:var(--box); padding:12px; border-radius:10px; font:13px ui-monospace, Menlo, monospace; }
+  h2 { font-size:18px; margin:24px 0 8px; }
   .hidden { display:none; }
 </style>
 </head>
@@ -27,7 +29,8 @@
     <p>Шаг 1. Введите App ID приложения из Meta Developers (это не секрет) и нажмите «Войти через Threads».</p>
     <input id="appid" inputmode="numeric" autocomplete="off" placeholder="App ID">
     <a id="go" class="btn" href="#" role="button">Войти через Threads</a>
-    <p id="nostore" class="hidden">Safari блокирует хранилище вкладки (частный режим или запрет данных сайтов). Без него нельзя проверить state: откройте страницу в обычной вкладке.</p>
+    <p id="nostore" class="hidden">Safari не даёт этой странице сохранить данные (частный режим или запрет данных сайтов). Без этого нельзя проверить state: откройте страницу в обычной вкладке Safari.</p>
+    <p>Если после нажатия откроется приложение Threads, вернитесь в Safari и начните заново: вход должен пройти в Safari.</p>
     <p>Страница ничего никуда не отправляет: здесь нет счётчиков, внешних скриптов и запросов.</p>
   </section>
   <section id="done" class="hidden">
@@ -38,65 +41,143 @@
     <p id="copied" class="hidden">Скопировано. После сохранения секрета скопируйте любой другой текст, чтобы очистить буфер.</p>
   </section>
   <section id="error" class="hidden">
-    <h1>Threads вернул ошибку</h1>
+    <h1 id="errtitle">Вход не завершён</h1>
     <p id="errtext"></p>
+  </section>
+  <section id="diag" class="hidden">
+    <h2>Диагностика</h2>
+    <p>Здесь нет кода, токенов и полного state: только «есть/нет», длины и первые 4 символа state. Этот текст можно переслать.</p>
+    <pre id="diagtext"></pre>
+    <button id="copydiag" type="button">Скопировать диагностику</button>
   </section>
 </main>
 <script>
 (function () {
+  var VERSION = "2";
   var REDIRECT = "https://skychwdkh5-design.github.io/gosha-oauth-callback/";
   var SCOPES = "threads_basic,threads_content_publish,threads_manage_insights";
   var STATE_KEY = "gosha_oauth_state";
+  var STATE_TTL_MS = 15 * 60 * 1000;
   var q = new URLSearchParams(window.location.search);
   var code = q.get("code");
   var err = q.get("error") || q.get("error_reason");
-  var returned = q.get("state") || "";
-  function show(id) { document.getElementById(id).classList.remove("hidden"); }
-  function hide(id) { document.getElementById(id).classList.add("hidden"); }
-  function storage() { try { return window.sessionStorage; } catch (e) { return null; } }
+  var returned = (q.get("state") || "").replace(/#_$/, "");
+  var hash = window.location.hash;
+  function el(id) { return document.getElementById(id); }
+  function show(id) { el(id).classList.remove("hidden"); }
+  function hide(id) { el(id).classList.add("hidden"); }
+  function store(name) {
+    try { var s = window[name]; var k = STATE_KEY + "_probe"; s.setItem(k, "1"); s.removeItem(k); return s; }
+    catch (e) { return null; }
+  }
+  // localStorage общий для всех вкладок Safari этого сайта: state переживает возврат в новой вкладке.
+  // sessionStorage — запасной вариант, если localStorage недоступен.
+  var stores = { local: store("localStorage"), session: store("sessionStorage") };
   function newState() {
     var b = new Uint8Array(32); window.crypto.getRandomValues(b);
     return Array.prototype.map.call(b, function (x) { return ("0" + x.toString(16)).slice(-2); }).join("");
   }
-  // Защита от CSRF: state создаётся здесь перед входом, хранится только в этой вкладке
-  // (sessionStorage, это не код) и одноразово сверяется при возврате. Код нигде не сохраняется.
-  var expected = "";
-  var st = storage();
+  function takeState() {
+    // Читаем и сразу удаляем: state одноразовый.
+    var found = null;
+    ["local", "session"].forEach(function (n) {
+      var s = stores[n]; if (!s) return;
+      var raw = null;
+      try { raw = s.getItem(STATE_KEY); s.removeItem(STATE_KEY); } catch (e) { raw = null; }
+      if (raw && !found) {
+        try { var v = JSON.parse(raw); if (v && typeof v.s === "string") found = { s: v.s, t: +v.t || 0, where: n }; }
+        catch (e) { /* повреждённое значение считаем отсутствующим */ }
+      }
+    });
+    return found;
+  }
+  function same(a, b) {
+    if (a.length !== b.length) return false;
+    var d = 0; for (var i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    return d === 0;
+  }
+  function inApp(ua) {
+    var m = ua.match(/Barcelona|Instagram|FBAN|FBAV|FB_IAB|Threads/);
+    return m ? m[0] : "нет";
+  }
+  function browser(ua) {
+    var dev = /iPad/.test(ua) ? "iPad" : /iPhone/.test(ua) ? "iPhone" :
+      (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1) ? "iPad (полная версия сайта)" : /Macintosh/.test(ua) ? "Mac" : "другое";
+    var br = /CriOS/.test(ua) ? "Chrome" : /FxiOS/.test(ua) ? "Firefox" : /EdgiOS/.test(ua) ? "Edge" :
+      /Version\/[\d.]+.*Safari/.test(ua) ? "Safari " + (ua.match(/Version\/([\d.]+)/) || [])[1] : "WebView/другой";
+    return dev + ", " + br;
+  }
+  var diag = null;
   if (code || err || returned) {
     // Убираем код и state из адресной строки сразу, до любой другой работы.
     window.history.replaceState(null, "", window.location.pathname);
     hide("start");
-    if (st) { try { expected = st.getItem(STATE_KEY) || ""; st.removeItem(STATE_KEY); } catch (e) { expected = ""; } }
+    var saved = takeState();
+    var reason = "ok";
+    if (err) reason = "threads_error";
+    else if (!code) reason = "no_code";
+    else if (!returned) reason = "state_not_returned";
+    else if (!saved) reason = "state_not_found";
+    else if (Date.now() - saved.t > STATE_TTL_MS) reason = "state_expired";
+    else if (!same(returned, saved.s)) reason = "state_mismatch";
+    var ref = "";
+    try { ref = document.referrer ? new URL(document.referrer).origin : "нет"; } catch (e) { ref = "?"; }
+    var ua = navigator.userAgent || "";
+    diag = [
+      "страница: v" + VERSION,
+      "итог: " + reason,
+      "параметры в адресе: " + (Array.from(q.keys()).join(", ") || "нет"),
+      "фрагмент: " + (hash ? (hash === "#_" ? "#_" : "есть, " + hash.length + " симв.") : "нет"),
+      "code: " + (code ? "есть, " + code.length + " симв." : "нет"),
+      "state от Threads: " + (returned ? "есть, " + returned.length + " симв., начало " + returned.slice(0, 4) : "нет"),
+      "сохранённый state: " + (saved ? saved.where + ", " + saved.s.length + " симв., начало " + saved.s.slice(0, 4) +
+        ", возраст " + Math.round((Date.now() - saved.t) / 1000) + " с" : "не найден"),
+      "error от Threads: " + (err ? String(err).slice(0, 60) : "нет"),
+      "хранилище: localStorage " + (stores.local ? "да" : "нет") + ", sessionStorage " + (stores.session ? "да" : "нет"),
+      "вкладка: history.length " + window.history.length + ", opener " + (window.opener ? "да" : "нет"),
+      "пришли с: " + ref,
+      "браузер: " + browser(ua) + ", встроенный браузер приложения: " + inApp(ua)
+    ].join("\n");
+    el("diagtext").textContent = diag;
+    show("diag");
+    var msg = {
+      threads_error: "Threads вернул ошибку: " + String(q.get("error_description") || err || "").slice(0, 300),
+      no_code: "Threads вернул на страницу ответ без кода. Начните вход заново.",
+      state_not_returned: "Threads вернул код, но без state. Код не показан. Перешлите диагностику ниже.",
+      state_not_found: "В этом браузере нет state от начала входа. Обычно это значит, что вход завершился в другом приложении или браузере (например, открылось приложение Threads или Instagram) или в частном режиме. Код не показан. Начните заново со страницы в Safari и, если откроется приложение, вернитесь в Safari.",
+      state_expired: "С начала входа прошло больше 15 минут. Код не показан. Начните вход заново.",
+      state_mismatch: "Ответ относится к другой попытке входа (state не совпал). Код не показан. Начните вход заново один раз и не открывайте старые вкладки."
+    };
+    if (reason === "ok") {
+      el("code").value = code.replace(/#_$/, "");
+      show("done");
+    } else {
+      el("errtitle").textContent = reason === "threads_error" ? "Threads вернул ошибку" : "Вход не завершён";
+      el("errtext").textContent = msg[reason];
+      show("error");
+    }
   }
-  if (code && (!expected || returned !== expected)) {
-    code = null;
-    err = "state_mismatch";
+  function copy(text, done) {
+    (navigator.clipboard ? navigator.clipboard.writeText(text) : Promise.reject())
+      .catch(function () {
+        var t = document.createElement("textarea"); t.value = text; document.body.appendChild(t);
+        t.select(); document.execCommand("copy"); document.body.removeChild(t);
+      })
+      .then(done);
   }
-  if (code) {
-    document.getElementById("code").value = code.replace(/#_$/, "");
-    show("done");
-    document.getElementById("copy").addEventListener("click", function () {
-      var box = document.getElementById("code");
-      box.select();
-      (navigator.clipboard ? navigator.clipboard.writeText(box.value) : Promise.reject())
-        .catch(function () { document.execCommand("copy"); })
-        .then(function () { show("copied"); });
-    });
-  } else if (err) {
-    document.getElementById("errtext").textContent = err === "state_mismatch"
-      ? "Ответ не прошёл проверку state: код не показан. Откройте эту страницу заново и войдите ещё раз в этой же вкладке."
-      : (q.get("error_description") || err).slice(0, 300);
-    show("error");
-  }
-  var input = document.getElementById("appid");
-  document.getElementById("go").addEventListener("click", function (ev) {
+  el("copy").addEventListener("click", function () { copy(el("code").value, function () { show("copied"); }); });
+  el("copydiag").addEventListener("click", function () { copy(el("diagtext").textContent, function () {}); });
+  var input = el("appid");
+  el("go").addEventListener("click", function (ev) {
     ev.preventDefault();
     var id = input.value.replace(/\D/g, "");
     if (!id) { input.focus(); return; }
-    var s = storage();
-    if (!s) { document.getElementById("nostore").classList.remove("hidden"); return; }
+    var target = stores.local || stores.session;
+    if (!target) { show("nostore"); return; }
     var state = newState();
-    s.setItem(STATE_KEY, state);
+    var value = JSON.stringify({ s: state, t: Date.now() });
+    if (stores.local) stores.local.setItem(STATE_KEY, value);
+    if (stores.session) stores.session.setItem(STATE_KEY, value);
     window.location.assign("https://threads.net/oauth/authorize?client_id=" + id +
       "&redirect_uri=" + encodeURIComponent(REDIRECT) + "&scope=" + SCOPES +
       "&response_type=code&state=" + state);
